@@ -6,15 +6,21 @@ import qs.Ui
 
 // Live stream to YouTube, X, Twitch or any RTMP(S) server without OBS.
 // The heavy lifting is gpu-screen-recorder, driven by bin/livestream; this
-// file only picks a destination and monitor and shows the live state.
+// file picks the destination, monitor, webcam and audio, and drives the
+// live controls (mic switch/mute, desktop audio, webcam) mid-stream.
 Panel {
   id: root
   moduleName: "dhoenisch.livestream"
   ipcTarget: "dhoenisch.livestream"
+  // Own the IPC target so it can carry the live controls below.
+  manageIpc: false
 
   readonly property string pluginDir: decodeURIComponent(String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "")).replace(/\/$/, "")
   readonly property string helper: pluginDir + "/bin/livestream"
   readonly property string icon: String.fromCodePoint(0xF0003)
+  readonly property string micIcon: String.fromCodePoint(0xF036C)
+  readonly property string micOffIcon: String.fromCodePoint(0xF036D)
+  readonly property string desktopIcon: String.fromCodePoint(0xF057E)
 
   readonly property int fps: Math.round(Number(setting("fps", 60))) || 60
   readonly property int bitrateKbps: Math.round(Number(setting("bitrateKbps", 6000))) || 6000
@@ -31,6 +37,12 @@ Panel {
   property string selectedWebcam: ""
   property string selectedDestination: ""
   property string selectedMonitor: ""
+  // [{ id: source name, name, isDefault }]
+  property var mics: []
+  property string selectedMic: ""
+  property bool micMuted: false
+  property bool desktopAudio: true
+  property var controlQueue: []
 
   property string phase: "idle"   // idle | starting | live | stopping
   property string liveDestination: ""
@@ -68,7 +80,13 @@ Panel {
     if (!destProc.running) destProc.running = true
     if (!monitorProc.running) monitorProc.running = true
     if (!webcamProc.running) webcamProc.running = true
+    if (!micProc.running) micProc.running = true
     pollStatus()
+    if (live) syncAudio()
+  }
+
+  function syncAudio() {
+    if (!audioProc.running) audioProc.running = true
   }
 
   function pollStatus() {
@@ -81,7 +99,9 @@ Panel {
       liveDestination = fields[1] || ""
       liveMonitor = fields[2] || ""
       liveSince = Number(fields[3]) || Date.now() / 1000
+      var wasLive = phase === "live"
       phase = "live"
+      if (!wasLive) syncAudio()
     } else {
       if (fields[0] === "ended" && phase === "live") {
         error = strings.t("ended") + (fields[1] ? ": " + fields[1] : "")
@@ -124,6 +144,69 @@ Panel {
     if (ids.indexOf(selectedWebcam) < 0) selectedWebcam = list.length > 1 ? list[1].id : "none"
   }
 
+  function parseMics(raw) {
+    var list = []
+    var fallback = ""
+    String(raw || "").split("\n").forEach(function(line) {
+      var f = line.split("\t")
+      if (f.length < 3 || !/^[A-Za-z0-9_.:-]{1,200}$/.test(f[0])) return
+      list.push({ id: f[0], name: f[1].slice(0, 40), isDefault: f[2] === "1" })
+      if (f[2] === "1") fallback = f[0]
+    })
+    mics = list
+    var ids = list.map(function(m) { return m.id })
+    if (ids.indexOf(selectedMic) < 0) selectedMic = fallback || (list[0] ? list[0].id : "")
+  }
+
+  // What the running stream actually carries, so the panel never drifts.
+  function parseAudio(raw) {
+    String(raw || "").split("\n").forEach(function(line) {
+      var f = line.split("\t")
+      if (f[0] === "desktop") desktopAudio = f[1] === "on"
+      else if (f[0] === "mic") {
+        micMuted = f[1] === "off"
+        if (!micMuted && /^[A-Za-z0-9_.:-]{1,200}$/.test(f[1] || "")) selectedMic = f[1]
+      } else if (f[0] === "webcam") {
+        selectedWebcam = /^\/dev\/video[0-9]+$/.test(f[1] || "") ? f[1] : "none"
+      }
+    })
+  }
+
+  // Live changes run one at a time through the helper.
+  function control(args) {
+    if (!live) return
+    controlQueue = controlQueue.concat([args])
+    runNextControl()
+  }
+
+  function runNextControl() {
+    if (controlProc.running || controlQueue.length === 0) return
+    controlProc.command = [helper].concat(controlQueue[0])
+    controlQueue = controlQueue.slice(1)
+    controlProc.running = true
+  }
+
+  function setDesktopAudio(on) {
+    desktopAudio = on
+    control(["desktop", on ? "on" : "off"])
+  }
+
+  function chooseMic(id) {
+    selectedMic = id
+    if (!micMuted) control(["mic", id])
+  }
+
+  function toggleMute() {
+    if (!selectedMic) return
+    micMuted = !micMuted
+    control(["mic", micMuted ? "off" : selectedMic])
+  }
+
+  function chooseWebcam(id) {
+    selectedWebcam = id
+    control(id === "none" ? ["webcam", "off"] : ["webcam", id, webcamSize])
+  }
+
   function start() {
     if (busy || live || !selectedDestination || !selectedMonitor) return
     if (!destinationReady(selectedDestination)) {
@@ -133,7 +216,8 @@ Panel {
     error = ""
     phase = "starting"
     startProc.command = [helper, "start", selectedDestination, selectedMonitor, String(fps), String(bitrateKbps),
-      selectedWebcam || "none", webcamSize]
+      selectedWebcam || "none", webcamSize,
+      desktopAudio ? "on" : "off", micMuted || !selectedMic ? "off" : selectedMic]
     startProc.running = true
   }
 
@@ -171,6 +255,44 @@ Panel {
     id: webcamProc
     command: [root.helper, "webcams"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseWebcams(text) }
+  }
+
+  Process {
+    id: micProc
+    command: [root.helper, "mics"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseMics(text) }
+  }
+
+  Process {
+    id: audioProc
+    command: [root.helper, "audio"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseAudio(text) }
+  }
+
+  Process {
+    id: controlProc
+    property string errText: ""
+    stderr: StdioCollector { waitForEnd: true; onStreamFinished: controlProc.errText = String(text || "").trim().slice(0, 200) }
+    onExited: function(exitCode) {
+      if (exitCode !== 0 && controlProc.errText) root.error = controlProc.errText
+      if (root.controlQueue.length > 0) root.runNextControl()
+      else root.syncAudio()
+    }
+  }
+
+  ShellIpc {
+    target: "dhoenisch.livestream"
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function start(): void { root.start() }
+    function stop(): void { root.stop() }
+    function toggleLive(): void { root.live ? root.stop() : root.start() }
+    function toggleMute(): void { root.toggleMute() }
+    function toggleDesktopAudio(): void { root.setDesktopAudio(!root.desktopAudio) }
   }
 
   Process {
@@ -213,11 +335,12 @@ Panel {
     bar: root.bar
     text: root.icon
     active: root.live
-    labelText: root.live && !vertical ? root.elapsed() : ""
-    slotSize: Style.bar.iconSlot * (root.live && !vertical ? 2.6 : 1)
+    labelText: root.live && !vertical ? root.elapsed() + (root.micMuted ? " " + root.micOffIcon : "") : ""
+    slotSize: Style.bar.iconSlot * (root.live && !vertical ? (root.micMuted ? 3.4 : 2.6) : 1)
     tooltipText: ""
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.live ? root.stop() : root.start()
+      else if (b === Qt.RightButton && root.live) root.toggleMute()
       else root.toggle()
     }
   }
@@ -359,7 +482,7 @@ Panel {
           width: parent.width
           spacing: Style.space(10)
           visible: root.webcams.length > 1
-          enabled: !root.live && !root.busy
+          enabled: !root.busy
           opacity: enabled ? 1 : 0.5
 
           PanelSectionHeader {
@@ -373,7 +496,61 @@ Panel {
             labelOf: function(w) { return w.name }
             isActive: function(w) { return w.id === root.selectedWebcam }
             isDim: function(w) { return false }
-            onChosen: function(w) { root.selectedWebcam = w.id }
+            onChosen: function(w) { root.live ? root.chooseWebcam(w.id) : root.selectedWebcam = w.id }
+          }
+        }
+
+        // ---------- Audio ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+          enabled: !root.busy
+
+          PanelSectionHeader {
+            text: strings.t("audioSection")
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+
+          Row {
+            id: audioToggles
+            width: parent.width
+            spacing: Style.space(6)
+            readonly property real cellWidth: (width - spacing) / 2
+
+            Button {
+              width: audioToggles.cellWidth
+              text: strings.t("desktopAudio")
+              iconText: root.desktopIcon
+              fontSize: Style.font.bodySmall
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              active: root.desktopAudio
+              opacity: root.desktopAudio ? 1 : 0.6
+              onClicked: root.setDesktopAudio(!root.desktopAudio)
+            }
+
+            Button {
+              width: audioToggles.cellWidth
+              text: root.micMuted ? strings.t("micMuted") : strings.t("micLive")
+              iconText: root.micMuted ? root.micOffIcon : root.micIcon
+              fontSize: Style.font.bodySmall
+              foreground: root.micMuted ? root.urgentColor : root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              active: !root.micMuted
+              enabled: root.selectedMic !== ""
+              onClicked: root.toggleMute()
+            }
+          }
+
+          ChoiceRow {
+            model: root.mics
+            labelOf: function(m) { return m.name }
+            isActive: function(m) { return m.id === root.selectedMic }
+            isDim: function(m) { return root.micMuted }
+            onChosen: function(m) { root.chooseMic(m.id) }
           }
         }
 
@@ -381,8 +558,7 @@ Panel {
           width: parent.width
           opacity: 0.6
           font.pixelSize: Style.font.caption
-          text: strings.t("audio") + " · " + Commons.I18n.formatNumber(root.fps) + " fps · "
-            + Commons.I18n.formatNumber(root.bitrateKbps) + " kbps"
+          text: Commons.I18n.formatNumber(root.fps) + " fps · " + Commons.I18n.formatNumber(root.bitrateKbps) + " kbps"
         }
 
         PlainText {

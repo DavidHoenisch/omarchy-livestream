@@ -11,11 +11,14 @@
   "goLive": "Go live",
   "stop": "End stream",
   "editKeys": "Edit stream keys",
-  "audio": "Desktop audio + microphone",
   "liveOn": "Streaming %1 to %2",
   "ended": "Stream ended unexpectedly",
   "notify.live": "You are live on %1",
   "notify.ended": "Live stream ended",
   "webcam": "Webcam",
-  "webcamOff": "Off"
+  "webcamOff": "Off",
+  "audioSection": "Audio",
+  "desktopAudio": "Desktop audio",
+  "micLive": "Mic on",
+  "micMuted": "Mic muted"
 }

@@ -11,6 +11,7 @@
 #                    [desktop on|off] [mic source|default|off]
 #   livestream desktop on|off        change desktop audio of the running stream
 #   livestream mic <source>|off      switch or mute the microphone of the running stream
+#   livestream webcam <device>|off [size]  show, switch or hide the webcam while live
 #   livestream stop
 #
 # Audio goes through a private null sink (omarchy_livestream): desktop audio
@@ -24,12 +25,14 @@ set -uo pipefail
 
 KEYS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/livestream"
 KEYS="$KEYS_DIR/keys.json"
-STATE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-livestream-$UID"
+# Overridable so tests never touch a real stream.
+STATE="${LIVESTREAM_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/omarchy-livestream-$UID}"
 PID_FILE="$STATE/pid"
 INFO_FILE="$STATE/info"
 LOG_FILE="$STATE/log"
 CAM_PID_FILE="$STATE/webcam-pid"
-MIX=omarchy_livestream
+MIX="${LIVESTREAM_MIX:-omarchy_livestream}"
+[[ $MIX =~ ^[a-z0-9_]{1,40}$ ]] || { echo "Invalid LIVESTREAM_MIX" >&2; exit 1; }
 MIX_MOD="$STATE/mix-module"
 DESKTOP_MOD="$STATE/desktop-module"
 MIC_MOD="$STATE/mic-module"
@@ -122,6 +125,7 @@ start_webcam() {
     --no-border --no-audio --no-osc --osd-level=0 \
     --really-quiet </dev/null &>/dev/null &
   printf '%s' "$!" >"$CAM_PID_FILE"
+  printf '%s' "$device" >"$CAM_PID_FILE.device"
 
   local i
   for i in $(seq 1 60); do
@@ -139,7 +143,17 @@ stop_webcam() {
   if [[ $pid =~ ^[0-9]+$ && $(cat "/proc/$pid/comm" 2>/dev/null) == mpv ]]; then
     kill "$pid" 2>/dev/null
   fi
-  rm -f "$CAM_PID_FILE"
+  rm -f "$CAM_PID_FILE" "$CAM_PID_FILE.device"
+}
+
+webcam_device() {
+  local pid
+  [[ -f $CAM_PID_FILE ]] && pid=$(<"$CAM_PID_FILE")
+  if [[ ${pid:-} =~ ^[0-9]+$ && $(cat "/proc/$pid/comm" 2>/dev/null) == mpv && -f $CAM_PID_FILE.device ]]; then
+    cat "$CAM_PID_FILE.device"
+  else
+    echo off
+  fi
 }
 
 valid_source() {
@@ -210,6 +224,7 @@ mic_on() {
 }
 
 cmd_audio() {
+  printf 'webcam\t%s\n' "$(webcam_device)"
   printf 'desktop\t%s\n' "$([[ -f $DESKTOP_MOD ]] && echo on || echo off)"
   printf 'mic\t%s\n' "$([[ -f $MIC_MOD && -f $MIC_SRC ]] && cat "$MIC_SRC" || echo off)"
 }
@@ -229,6 +244,22 @@ cmd_mic() {
     off) unload_mod "$MIC_MOD"; rm -f "$MIC_SRC" ;;
     "") die "usage: livestream mic <source>|off" ;;
     *) mic_on "$1" ;;
+  esac
+}
+
+cmd_webcam() {
+  running_pid >/dev/null && [[ -f $INFO_FILE ]] || die "Not live"
+  local device=${1:-} size=${2:-medium} monitor
+  [[ $size =~ ^(small|medium|large)$ ]] || die "Invalid webcam size"
+  case $device in
+    off) stop_webcam ;;
+    /dev/video[0-9]*)
+      [[ $device =~ ^/dev/video[0-9]+$ ]] || die "Invalid webcam"
+      monitor=$(cut -f2 "$INFO_FILE")
+      [[ $monitor =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "Invalid monitor"
+      start_webcam "$device" "$size" "$monitor"
+      ;;
+    *) die "usage: livestream webcam <device>|off [size]" ;;
   esac
 }
 
@@ -327,6 +358,7 @@ case "${1:-}" in
   audio) cmd_audio ;;
   desktop) shift; cmd_desktop "$@" ;;
   mic) shift; cmd_mic "$@" ;;
+  webcam) shift; cmd_webcam "$@" ;;
   status) cmd_status ;;
   start) shift; cmd_start "$@" ;;
   stop) cmd_stop ;;
