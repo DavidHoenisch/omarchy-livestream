@@ -5,8 +5,17 @@
 #   livestream monitors              monitor names, focused first
 #   livestream webcams               device<TAB>name per capture-capable webcam
 #   livestream status                idle | live<TAB>dest<TAB>monitor<TAB>startEpoch | ended<TAB>reason
+#   livestream mics                  source<TAB>name<TAB>default(0|1) per microphone
+#   livestream audio                 desktop<TAB>on|off, mic<TAB>source|off (current stream)
 #   livestream start <dest> <monitor> [fps] [kbps] [webcam|none] [small|medium|large]
+#                    [desktop on|off] [mic source|default|off]
+#   livestream desktop on|off        change desktop audio of the running stream
+#   livestream mic <source>|off      switch or mute the microphone of the running stream
 #   livestream stop
+#
+# Audio goes through a private null sink (omarchy_livestream): desktop audio
+# and the microphone each feed it through their own loopback, and the stream
+# records its monitor, so either can change without restarting the stream.
 #   livestream keys-path             create the keys file if missing, print its path
 #
 # Stream keys live in ~/.config/omarchy/livestream/keys.json (mode 600).
@@ -20,6 +29,11 @@ PID_FILE="$STATE/pid"
 INFO_FILE="$STATE/info"
 LOG_FILE="$STATE/log"
 CAM_PID_FILE="$STATE/webcam-pid"
+MIX=omarchy_livestream
+MIX_MOD="$STATE/mix-module"
+DESKTOP_MOD="$STATE/desktop-module"
+MIC_MOD="$STATE/mic-module"
+MIC_SRC="$STATE/mic-source"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -128,12 +142,103 @@ stop_webcam() {
   rm -f "$CAM_PID_FILE"
 }
 
+valid_source() {
+  [[ $1 =~ ^[A-Za-z0-9_.:-]{1,200}$ && $1 != *.monitor && $1 != "$MIX"* ]] &&
+    pactl list short sources 2>/dev/null | cut -f2 | grep -qxF "$1"
+}
+
+cmd_mics() {
+  local default
+  default=$(pactl get-default-source 2>/dev/null)
+  pactl -f json list sources 2>/dev/null | jq -r --arg d "$default" --arg mix "$MIX" '
+    .[] | select((.name | endswith(".monitor") | not) and (.name | startswith($mix) | not))
+    | [.name,
+       ((.description // .name) | sub(" (Analog Stereo|Analog Mono|Mono|Stereo)$"; "") | gsub("[\t\n]"; " ") | .[0:40]),
+       (if .name == $d then "1" else "0" end)]
+    | @tsv'
+}
+
+unload_mod() {
+  local file=$1 id
+  [[ -f $file ]] || return 0
+  id=$(<"$file")
+  [[ $id =~ ^[0-9]+$ ]] && pactl unload-module "$id" 2>/dev/null
+  rm -f "$file"
+}
+
+loopback() {
+  pactl load-module module-loopback source="$1" sink="$MIX" latency_msec=20 \
+    source_dont_move=true sink_dont_move=true \
+    sink_input_properties=media.name=omarchy-livestream 2>/dev/null
+}
+
+mix_up() {
+  mix_down
+  local before id
+  before=$(pactl get-default-sink 2>/dev/null)
+  id=$(pactl load-module module-null-sink sink_name="$MIX" \
+    sink_properties=device.description=Live-Stream-Mix 2>/dev/null) || die "Could not create the audio mix"
+  printf '%s' "$id" >"$MIX_MOD"
+  # Never let the mix become the speakers.
+  [[ -n $before && $(pactl get-default-sink 2>/dev/null) != "$before" ]] && pactl set-default-sink "$before"
+}
+
+mix_down() {
+  unload_mod "$MIC_MOD"
+  unload_mod "$DESKTOP_MOD"
+  unload_mod "$MIX_MOD"
+  rm -f "$MIC_SRC"
+}
+
+desktop_on() {
+  [[ -f $DESKTOP_MOD ]] && return 0
+  local sink id
+  sink=$(pactl get-default-sink 2>/dev/null)
+  [[ -n $sink && $sink != "$MIX" ]] || die "No desktop audio output found"
+  id=$(loopback "$sink.monitor") || die "Could not add desktop audio"
+  printf '%s' "$id" >"$DESKTOP_MOD"
+}
+
+mic_on() {
+  local src=$1 id
+  [[ $src == default ]] && src=$(pactl get-default-source 2>/dev/null)
+  valid_source "$src" || die "Microphone not found"
+  unload_mod "$MIC_MOD"
+  id=$(loopback "$src") || die "Could not add microphone"
+  printf '%s' "$id" >"$MIC_MOD"
+  printf '%s' "$src" >"$MIC_SRC"
+}
+
+cmd_audio() {
+  printf 'desktop\t%s\n' "$([[ -f $DESKTOP_MOD ]] && echo on || echo off)"
+  printf 'mic\t%s\n' "$([[ -f $MIC_MOD && -f $MIC_SRC ]] && cat "$MIC_SRC" || echo off)"
+}
+
+cmd_desktop() {
+  [[ -f $MIX_MOD ]] || die "Not live"
+  case ${1:-} in
+    on) desktop_on ;;
+    off) unload_mod "$DESKTOP_MOD" ;;
+    *) die "usage: livestream desktop on|off" ;;
+  esac
+}
+
+cmd_mic() {
+  [[ -f $MIX_MOD ]] || die "Not live"
+  case ${1:-} in
+    off) unload_mod "$MIC_MOD"; rm -f "$MIC_SRC" ;;
+    "") die "usage: livestream mic <source>|off" ;;
+    *) mic_on "$1" ;;
+  esac
+}
+
 cmd_status() {
   if running_pid >/dev/null && [[ -f $INFO_FILE ]]; then
     printf 'live\t%s\n' "$(<"$INFO_FILE")"
   elif [[ -f $INFO_FILE ]]; then
     printf 'ended\t%s\n' "$(last_error)"
     stop_webcam
+    mix_down
     rm -f "$INFO_FILE" "$PID_FILE"
   else
     echo idle
@@ -141,7 +246,8 @@ cmd_status() {
 }
 
 cmd_start() {
-  local dest=${1:-} monitor=${2:-} fps=${3:-60} kbps=${4:-6000} webcam=${5:-none} size=${6:-medium}
+  local dest=${1:-} monitor=${2:-} fps=${3:-60} kbps=${4:-6000} webcam=${5:-none} size=${6:-medium} desktop=${7:-on} mic=${8:-default}
+  [[ $desktop =~ ^(on|off)$ ]] || die "Invalid desktop audio choice"
   [[ $webcam == none || $webcam =~ ^/dev/video[0-9]+$ ]] || die "Invalid webcam"
   [[ $size =~ ^(small|medium|large)$ ]] || die "Invalid webcam size"
   [[ $dest =~ ^[a-z0-9_-]{1,32}$ ]] || die "Invalid destination"
@@ -162,13 +268,19 @@ cmd_start() {
   : >"$LOG_FILE"
   chmod 600 "$LOG_FILE"
 
+  # Any failure from here on tears down what was set up.
+  trap 'stop_webcam; mix_down' EXIT
+  mix_up
+  [[ $desktop == on ]] && desktop_on
+  [[ $mic != off ]] && mic_on "$mic"
+
   # Open the camera first so the stream doesn't show it sliding into place.
   [[ $webcam != none ]] && start_webcam "$webcam" "$size" "$monitor"
 
   setsid gpu-screen-recorder \
     -w "$monitor" -c flv -k h264 -f "$fps" -fm cfr \
     -bm cbr -q "$kbps" -keyint 2 \
-    -a "default_output|default_input" -ac aac -ab 160 \
+    -a "$MIX.monitor" -ac aac -ab 160 \
     -fallback-cpu-encoding yes \
     -o "${url%/}/$key" \
     </dev/null >>"$LOG_FILE" 2>&1 &
@@ -185,14 +297,16 @@ cmd_start() {
       reason=$(last_error)
       rm -f "$INFO_FILE" "$PID_FILE"
       stop_webcam
+      mix_down
       die "Stream failed to start${reason:+: $reason}"
     fi
   done
+  trap - EXIT
 }
 
 cmd_stop() {
   local pid
-  pid=$(running_pid) || { rm -f "$INFO_FILE" "$PID_FILE"; stop_webcam; return 0; }
+  pid=$(running_pid) || { rm -f "$INFO_FILE" "$PID_FILE"; stop_webcam; mix_down; return 0; }
   kill -INT "$pid" 2>/dev/null
   local i
   for i in $(seq 1 50); do
@@ -201,6 +315,7 @@ cmd_stop() {
   done
   kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
   stop_webcam
+  mix_down
   rm -f "$INFO_FILE" "$PID_FILE"
 }
 
@@ -208,9 +323,13 @@ case "${1:-}" in
   destinations) cmd_destinations ;;
   monitors) cmd_monitors ;;
   webcams) cmd_webcams ;;
+  mics) cmd_mics ;;
+  audio) cmd_audio ;;
+  desktop) shift; cmd_desktop "$@" ;;
+  mic) shift; cmd_mic "$@" ;;
   status) cmd_status ;;
   start) shift; cmd_start "$@" ;;
   stop) cmd_stop ;;
   keys-path) ensure_keys; printf '%s\n' "$KEYS" ;;
-  *) die "usage: livestream destinations|monitors|status|start <dest> <monitor> [fps] [kbps] [webcam|none] [size]|stop|keys-path" ;;
+  *) die "usage: livestream destinations|monitors|status|start <dest> <monitor> [fps] [kbps] [webcam|none] [size] [on|off] [mic|default|off]|desktop on|off|mic <source>|off|mics|audio|stop|keys-path" ;;
 esac
