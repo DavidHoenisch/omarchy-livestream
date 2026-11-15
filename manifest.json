@@ -17,7 +17,7 @@
     "description": "Pick a destination and monitor, then start or stop a live stream with desktop audio and microphone.",
     "category": "Media",
     "allowMultiple": false,
-    "defaultSection": "centerEnd",
+    "defaultSection": "center",
     "defaults": {
       "fps": 60,
       "bitrateKbps": 6000,
