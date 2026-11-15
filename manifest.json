@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
-  "id": "dhoenisch.livestream",
+  "id": "io.github.davidhoenisch.omarchystream",
   "name": "Live Stream",
   "version": "0.1.0",
-  "author": "dhoenisch",
+  "author": "David Hoenisch",
   "license": "MIT",
   "description": "Go live to YouTube, X, Twitch or any RTMP server straight from the bar, no OBS needed.",
   "kinds": [

@@ -10,8 +10,8 @@ import qs.Ui
 // live controls (mic switch/mute, desktop audio, webcam) mid-stream.
 Panel {
   id: root
-  moduleName: "dhoenisch.livestream"
-  ipcTarget: "dhoenisch.livestream"
+  moduleName: "io.github.davidhoenisch.omarchystream"
+  ipcTarget: "io.github.davidhoenisch.omarchystream"
   // Own the IPC target so it can carry the live controls below.
   manageIpc: false
 
@@ -281,7 +281,7 @@ Panel {
   }
 
   ShellIpc {
-    target: "dhoenisch.livestream"
+    target: "io.github.davidhoenisch.omarchystream"
 
     function open(): void { root.open() }
     function close(): void { root.close() }

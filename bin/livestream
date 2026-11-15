@@ -26,7 +26,7 @@ set -uo pipefail
 KEYS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/livestream"
 KEYS="$KEYS_DIR/keys.json"
 # Overridable so tests never touch a real stream.
-STATE="${LIVESTREAM_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/omarchy-livestream-$UID}"
+STATE="${LIVESTREAM_STATE_DIR:-${XDG_RUNTIME_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}}/omarchy-livestream-$UID}"
 PID_FILE="$STATE/pid"
 INFO_FILE="$STATE/info"
 LOG_FILE="$STATE/log"
