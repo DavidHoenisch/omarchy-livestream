@@ -15,5 +15,7 @@
   "liveOn": "Streaming %1 to %2",
   "ended": "Stream ended unexpectedly",
   "notify.live": "You are live on %1",
-  "notify.ended": "Live stream ended"
+  "notify.ended": "Live stream ended",
+  "webcam": "Webcam",
+  "webcamOff": "Off"
 }

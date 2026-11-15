@@ -3,8 +3,9 @@
 #
 #   livestream destinations          id<TAB>name<TAB>ready(0|1) per destination
 #   livestream monitors              monitor names, focused first
+#   livestream webcams               device<TAB>name per capture-capable webcam
 #   livestream status                idle | live<TAB>dest<TAB>monitor<TAB>startEpoch | ended<TAB>reason
-#   livestream start <dest> <monitor> [fps] [kbps]
+#   livestream start <dest> <monitor> [fps] [kbps] [webcam|none] [small|medium|large]
 #   livestream stop
 #   livestream keys-path             create the keys file if missing, print its path
 #
@@ -18,6 +19,7 @@ STATE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-livestream-$UID"
 PID_FILE="$STATE/pid"
 INFO_FILE="$STATE/info"
 LOG_FILE="$STATE/log"
+CAM_PID_FILE="$STATE/webcam-pid"
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -73,11 +75,65 @@ cmd_monitors() {
   hyprctl monitors -j | jq -r 'sort_by(.focused | not) | .[].name'
 }
 
+cmd_webcams() {
+  omarchy-capture-webcam-list | while read -r device name; do
+    [[ $device =~ ^/dev/video[0-9]+$ ]] || continue
+    name=${name%:}
+    printf '%s\t%s\n' "$device" "${name%% (*}"
+  done
+}
+
+# Omarchy's own webcam overlay (same mpv window and Hyprland rules that
+# omarchy capture screenrecording uses), placed on the streamed monitor so the
+# screen capture picks it up. SUPER+ALT+-/= resize it while live.
+start_webcam() {
+  local device=$1 size=$2 monitor=$3
+  stop_webcam
+  [[ -e $device ]] || die "Webcam $device not found"
+
+  local opts="framerate=30" formats res
+  formats=$(v4l2-ctl --list-formats-ext -d "$device" 2>/dev/null)
+  for res in 640x360 1280x720 1920x1080; do
+    if grep -q "$res" <<<"$formats"; then opts="video_size=$res,$opts"; break; fi
+  done
+
+  hyprctl dispatch "hl.dsp.focus({ monitor = \"$monitor\" })" >/dev/null 2>&1 ||
+    hyprctl dispatch focusmonitor "$monitor" >/dev/null 2>&1
+
+  setsid mpv "av://v4l2:$device" \
+    --profile=low-latency --untimed --no-cache \
+    --demuxer-lavf-o="$opts" \
+    '--vf=lavfi=[crop=ih*8/9:ih]' \
+    --title="WebcamOverlay" --wayland-app-id="WebcamOverlay-$size" \
+    --no-border --no-audio --no-osc --osd-level=0 \
+    --really-quiet </dev/null &>/dev/null &
+  printf '%s' "$!" >"$CAM_PID_FILE"
+
+  local i
+  for i in $(seq 1 60); do
+    hyprctl clients -j | jq -e 'any(.[]; .title == "WebcamOverlay")' >/dev/null 2>&1 && break
+    sleep 0.05
+  done
+  omarchy-capture-webcam-resize "$size" 2>/dev/null
+  sleep 0.4
+}
+
+stop_webcam() {
+  [[ -f $CAM_PID_FILE ]] || return 0
+  local pid
+  pid=$(<"$CAM_PID_FILE")
+  if [[ $pid =~ ^[0-9]+$ && $(cat "/proc/$pid/comm" 2>/dev/null) == mpv ]]; then
+    kill "$pid" 2>/dev/null
+  fi
+  rm -f "$CAM_PID_FILE"
+}
+
 cmd_status() {
   if running_pid >/dev/null && [[ -f $INFO_FILE ]]; then
     printf 'live\t%s\n' "$(<"$INFO_FILE")"
   elif [[ -f $INFO_FILE ]]; then
     printf 'ended\t%s\n' "$(last_error)"
+    stop_webcam
     rm -f "$INFO_FILE" "$PID_FILE"
   else
     echo idle
@@ -85,7 +141,9 @@ cmd_status() {
 }
 
 cmd_start() {
-  local dest=${1:-} monitor=${2:-} fps=${3:-60} kbps=${4:-6000}
+  local dest=${1:-} monitor=${2:-} fps=${3:-60} kbps=${4:-6000} webcam=${5:-none} size=${6:-medium}
+  [[ $webcam == none || $webcam =~ ^/dev/video[0-9]+$ ]] || die "Invalid webcam"
+  [[ $size =~ ^(small|medium|large)$ ]] || die "Invalid webcam size"
   [[ $dest =~ ^[a-z0-9_-]{1,32}$ ]] || die "Invalid destination"
   [[ $monitor =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "Invalid monitor"
   [[ $fps =~ ^[0-9]+$ ]] && ((fps >= 10 && fps <= 120)) || die "Invalid fps"
@@ -103,6 +161,9 @@ cmd_start() {
   ensure_state
   : >"$LOG_FILE"
   chmod 600 "$LOG_FILE"
+
+  # Open the camera first so the stream doesn't show it sliding into place.
+  [[ $webcam != none ]] && start_webcam "$webcam" "$size" "$monitor"
 
   setsid gpu-screen-recorder \
     -w "$monitor" -c flv -k h264 -f "$fps" -fm cfr \
@@ -123,6 +184,7 @@ cmd_start() {
       local reason
       reason=$(last_error)
       rm -f "$INFO_FILE" "$PID_FILE"
+      stop_webcam
       die "Stream failed to start${reason:+: $reason}"
     fi
   done
@@ -130,7 +192,7 @@ cmd_start() {
 
 cmd_stop() {
   local pid
-  pid=$(running_pid) || { rm -f "$INFO_FILE" "$PID_FILE"; return 0; }
+  pid=$(running_pid) || { rm -f "$INFO_FILE" "$PID_FILE"; stop_webcam; return 0; }
   kill -INT "$pid" 2>/dev/null
   local i
   for i in $(seq 1 50); do
@@ -138,15 +200,17 @@ cmd_stop() {
     sleep 0.1
   done
   kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+  stop_webcam
   rm -f "$INFO_FILE" "$PID_FILE"
 }
 
 case "${1:-}" in
   destinations) cmd_destinations ;;
   monitors) cmd_monitors ;;
+  webcams) cmd_webcams ;;
   status) cmd_status ;;
   start) shift; cmd_start "$@" ;;
   stop) cmd_stop ;;
   keys-path) ensure_keys; printf '%s\n' "$KEYS" ;;
-  *) die "usage: livestream destinations|monitors|status|start <dest> <monitor> [fps] [kbps]|stop|keys-path" ;;
+  *) die "usage: livestream destinations|monitors|status|start <dest> <monitor> [fps] [kbps] [webcam|none] [size]|stop|keys-path" ;;
 esac

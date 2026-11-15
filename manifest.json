@@ -20,11 +20,39 @@
     "defaultSection": "centerEnd",
     "defaults": {
       "fps": 60,
-      "bitrateKbps": 6000
+      "bitrateKbps": 6000,
+      "webcamSize": "medium"
     },
     "schema": [
-      { "key": "fps", "type": "integer", "label": "Frames per second", "min": 10, "max": 120, "step": 1, "defaultValue": 60 },
-      { "key": "bitrateKbps", "type": "integer", "label": "Video bitrate (kbps)", "min": 500, "max": 50000, "step": 500, "defaultValue": 6000 }
+      {
+        "key": "fps",
+        "type": "integer",
+        "label": "Frames per second",
+        "min": 10,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 60
+      },
+      {
+        "key": "bitrateKbps",
+        "type": "integer",
+        "label": "Video bitrate (kbps)",
+        "min": 500,
+        "max": 50000,
+        "step": 500,
+        "defaultValue": 6000
+      },
+      {
+        "key": "webcamSize",
+        "type": "enum",
+        "label": "Webcam overlay size",
+        "options": [
+          "small",
+          "medium",
+          "large"
+        ],
+        "defaultValue": "medium"
+      }
     ]
   }
 }

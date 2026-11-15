@@ -18,10 +18,17 @@ Panel {
 
   readonly property int fps: Math.round(Number(setting("fps", 60))) || 60
   readonly property int bitrateKbps: Math.round(Number(setting("bitrateKbps", 6000))) || 6000
+  readonly property string webcamSize: {
+    var v = String(setting("webcamSize", "medium"))
+    return ["small", "medium", "large"].indexOf(v) >= 0 ? v : "medium"
+  }
 
   // [{ id, name, ready }]
   property var destinations: []
   property var monitors: []
+  // [{ id: "none" | "/dev/videoN", name }]
+  property var webcams: []
+  property string selectedWebcam: ""
   property string selectedDestination: ""
   property string selectedMonitor: ""
 
@@ -60,6 +67,7 @@ Panel {
   function refresh() {
     if (!destProc.running) destProc.running = true
     if (!monitorProc.running) monitorProc.running = true
+    if (!webcamProc.running) webcamProc.running = true
     pollStatus()
   }
 
@@ -103,6 +111,19 @@ Panel {
     if (list.indexOf(selectedMonitor) < 0) selectedMonitor = list[0] || ""
   }
 
+  function parseWebcams(raw) {
+    var list = [{ id: "none", name: strings.t("webcamOff") }]
+    String(raw || "").split("\n").forEach(function(line) {
+      var f = line.split("\t")
+      if (f.length < 2 || !/^\/dev\/video[0-9]+$/.test(f[0])) return
+      list.push({ id: f[0], name: f[1].slice(0, 40) })
+    })
+    webcams = list
+    var ids = list.map(function(w) { return w.id })
+    // Default to the first camera; keep the user's pick while it exists.
+    if (ids.indexOf(selectedWebcam) < 0) selectedWebcam = list.length > 1 ? list[1].id : "none"
+  }
+
   function start() {
     if (busy || live || !selectedDestination || !selectedMonitor) return
     if (!destinationReady(selectedDestination)) {
@@ -111,7 +132,8 @@ Panel {
     }
     error = ""
     phase = "starting"
-    startProc.command = [helper, "start", selectedDestination, selectedMonitor, String(fps), String(bitrateKbps)]
+    startProc.command = [helper, "start", selectedDestination, selectedMonitor, String(fps), String(bitrateKbps),
+      selectedWebcam || "none", webcamSize]
     startProc.running = true
   }
 
@@ -143,6 +165,12 @@ Panel {
     id: monitorProc
     command: [root.helper, "monitors"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseMonitors(text) }
+  }
+
+  Process {
+    id: webcamProc
+    command: [root.helper, "webcams"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.parseWebcams(text) }
   }
 
   Process {
@@ -323,6 +351,29 @@ Panel {
             isActive: function(m) { return m === root.selectedMonitor }
             isDim: function(m) { return false }
             onChosen: function(m) { root.selectedMonitor = m }
+          }
+        }
+
+        // ---------- Webcam ----------
+        Column {
+          width: parent.width
+          spacing: Style.space(10)
+          visible: root.webcams.length > 1
+          enabled: !root.live && !root.busy
+          opacity: enabled ? 1 : 0.5
+
+          PanelSectionHeader {
+            text: strings.t("webcam")
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+
+          ChoiceRow {
+            model: root.webcams
+            labelOf: function(w) { return w.name }
+            isActive: function(w) { return w.id === root.selectedWebcam }
+            isDim: function(w) { return false }
+            onChosen: function(w) { root.selectedWebcam = w.id }
           }
         }
 
