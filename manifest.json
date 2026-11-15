@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "dhoenisch.livestream",
+  "name": "Live Stream",
+  "version": "0.1.0",
+  "author": "dhoenisch",
+  "license": "MIT",
+  "description": "Go live to YouTube, X, Twitch or any RTMP server straight from the bar, no OBS needed.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Live Stream",
+    "description": "Pick a destination and monitor, then start or stop a live stream with desktop audio and microphone.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "centerEnd",
+    "defaults": {
+      "fps": 60,
+      "bitrateKbps": 6000
+    },
+    "schema": [
+      { "key": "fps", "type": "integer", "label": "Frames per second", "min": 10, "max": 120, "step": 1, "defaultValue": 60 },
+      { "key": "bitrateKbps", "type": "integer", "label": "Video bitrate (kbps)", "min": 500, "max": 50000, "step": 500, "defaultValue": 6000 }
+    ]
+  }
+}

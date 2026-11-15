@@ -1,0 +1,19 @@
+{
+  "title": "Live Stream",
+  "status.idle": "Offline",
+  "status.live": "Live · %1",
+  "status.starting": "Starting…",
+  "status.stopping": "Stopping…",
+  "destination": "Destination",
+  "monitor": "Monitor",
+  "noDestinations": "No stream keys yet. Edit keys to add one.",
+  "notConfigured": "%1 has no URL or key yet",
+  "goLive": "Go live",
+  "stop": "End stream",
+  "editKeys": "Edit stream keys",
+  "audio": "Desktop audio + microphone",
+  "liveOn": "Streaming %1 to %2",
+  "ended": "Stream ended unexpectedly",
+  "notify.live": "You are live on %1",
+  "notify.ended": "Live stream ended"
+}

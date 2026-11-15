@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Live stream a monitor to an RTMP(S) destination with gpu-screen-recorder.
+#
+#   livestream destinations          id<TAB>name<TAB>ready(0|1) per destination
+#   livestream monitors              monitor names, focused first
+#   livestream status                idle | live<TAB>dest<TAB>monitor<TAB>startEpoch | ended<TAB>reason
+#   livestream start <dest> <monitor> [fps] [kbps]
+#   livestream stop
+#   livestream keys-path             create the keys file if missing, print its path
+#
+# Stream keys live in ~/.config/omarchy/livestream/keys.json (mode 600).
+
+set -uo pipefail
+
+KEYS_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/livestream"
+KEYS="$KEYS_DIR/keys.json"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/omarchy-livestream-$UID"
+PID_FILE="$STATE/pid"
+INFO_FILE="$STATE/info"
+LOG_FILE="$STATE/log"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+ensure_keys() {
+  if [[ -f $KEYS ]]; then chmod 600 "$KEYS"; return; fi
+  mkdir -p "$KEYS_DIR"
+  chmod 700 "$KEYS_DIR"
+  (
+    umask 077
+    cat >"$KEYS" <<'EOF'
+{
+  "youtube": { "name": "YouTube", "url": "rtmp://a.rtmp.youtube.com/live2", "key": "" },
+  "x": { "name": "X", "url": "", "key": "" },
+  "twitch": { "name": "Twitch", "url": "rtmp://live.twitch.tv/app", "key": "" }
+}
+EOF
+  )
+}
+
+ensure_state() {
+  mkdir -p "$STATE"
+  chmod 700 "$STATE"
+}
+
+running_pid() {
+  [[ -f $PID_FILE ]] || return 1
+  local pid
+  pid=$(<"$PID_FILE")
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [[ $(cat "/proc/$pid/comm" 2>/dev/null) == gpu-screen-rec* ]] || return 1
+  printf '%s' "$pid"
+}
+
+# Last useful log line, with anything that looks like a URL removed so a
+# stream key never leaves the private log.
+last_error() {
+  [[ -f $LOG_FILE ]] || return
+  grep -v '^\s*$' "$LOG_FILE" | tail -n 1 | sed -E 's#rtmps?://[^ ]*#<url>#g' | cut -c1-200
+}
+
+cmd_destinations() {
+  ensure_keys
+  jq -r 'to_entries[]
+    | select(.key | test("^[a-z0-9_-]{1,32}$"))
+    | [.key,
+       ((.value.name // .key) | tostring | gsub("[\t\n]"; " ") | .[0:40]),
+       (if ((.value.url // "") | test("^rtmps?://")) and ((.value.key // "") | length > 0) then "1" else "0" end)]
+    | @tsv' "$KEYS" 2>/dev/null || die "keys.json is not valid JSON"
+}
+
+cmd_monitors() {
+  hyprctl monitors -j | jq -r 'sort_by(.focused | not) | .[].name'
+}
+
+cmd_status() {
+  if running_pid >/dev/null && [[ -f $INFO_FILE ]]; then
+    printf 'live\t%s\n' "$(<"$INFO_FILE")"
+  elif [[ -f $INFO_FILE ]]; then
+    printf 'ended\t%s\n' "$(last_error)"
+    rm -f "$INFO_FILE" "$PID_FILE"
+  else
+    echo idle
+  fi
+}
+
+cmd_start() {
+  local dest=${1:-} monitor=${2:-} fps=${3:-60} kbps=${4:-6000}
+  [[ $dest =~ ^[a-z0-9_-]{1,32}$ ]] || die "Invalid destination"
+  [[ $monitor =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "Invalid monitor"
+  [[ $fps =~ ^[0-9]+$ ]] && ((fps >= 10 && fps <= 120)) || die "Invalid fps"
+  [[ $kbps =~ ^[0-9]+$ ]] && ((kbps >= 500 && kbps <= 50000)) || die "Invalid bitrate"
+  running_pid >/dev/null && die "Already live"
+  command -v gpu-screen-recorder >/dev/null || die "gpu-screen-recorder is not installed"
+
+  ensure_keys
+  local url key
+  url=$(jq -r --arg d "$dest" '.[$d].url // ""' "$KEYS") || die "keys.json is not valid JSON"
+  key=$(jq -r --arg d "$dest" '.[$d].key // ""' "$KEYS")
+  [[ $url =~ ^rtmps?://[^[:space:]]+$ ]] || die "No RTMP URL set for $dest in keys.json"
+  [[ -n $key && ! $key =~ [[:space:]] ]] || die "No stream key set for $dest in keys.json"
+
+  ensure_state
+  : >"$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+
+  setsid gpu-screen-recorder \
+    -w "$monitor" -c flv -k h264 -f "$fps" -fm cfr \
+    -bm cbr -q "$kbps" -keyint 2 \
+    -a "default_output|default_input" -ac aac -ab 160 \
+    -fallback-cpu-encoding yes \
+    -o "${url%/}/$key" \
+    </dev/null >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s' "$pid" >"$PID_FILE"
+  printf '%s\t%s\t%s' "$dest" "$monitor" "$(date +%s)" >"$INFO_FILE"
+
+  # Fail fast on a bad key/URL or capture error.
+  local i
+  for i in 1 2 3 4 5 6; do
+    sleep 0.5
+    if ! kill -0 "$pid" 2>/dev/null; then
+      local reason
+      reason=$(last_error)
+      rm -f "$INFO_FILE" "$PID_FILE"
+      die "Stream failed to start${reason:+: $reason}"
+    fi
+  done
+}
+
+cmd_stop() {
+  local pid
+  pid=$(running_pid) || { rm -f "$INFO_FILE" "$PID_FILE"; return 0; }
+  kill -INT "$pid" 2>/dev/null
+  local i
+  for i in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null
+  rm -f "$INFO_FILE" "$PID_FILE"
+}
+
+case "${1:-}" in
+  destinations) cmd_destinations ;;
+  monitors) cmd_monitors ;;
+  status) cmd_status ;;
+  start) shift; cmd_start "$@" ;;
+  stop) cmd_stop ;;
+  keys-path) ensure_keys; printf '%s\n' "$KEYS" ;;
+  *) die "usage: livestream destinations|monitors|status|start <dest> <monitor> [fps] [kbps]|stop|keys-path" ;;
+esac
